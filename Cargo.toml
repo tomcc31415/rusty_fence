@@ -9,6 +9,7 @@ edition = "2021"
 trust-dns-resolver= "*"
 trust-dns-server= "*"
 trust-dns-proto= "*"
+structopt= "*"
 tokio = { version = "1", features = ["full"] }
 
 [profile.release]

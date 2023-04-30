@@ -1,23 +1,96 @@
 use std::collections::HashSet;
-use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use structopt::StructOpt;
+use trust_dns_proto::rr::RData;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::TokioAsyncResolver;
-//use trust_dns_server::server::ServerFuture;
-//use trust_dns_proto::rcode::RCode;
-//use trust_dns_proto::rcode::RCode;
-//use trust_dns_proto::rr::rdata::RData;
 use trust_dns_server::proto::op::{Message, MessageType, OpCode};
 use trust_dns_server::proto::rr::domain::Name;
-//use trust_dns_server::proto::rr::record_data::RData::A;
 use trust_dns_server::proto::rr::Record;
-//use trust_dns_server::rr::rdata::RData;
-use trust_dns_proto::rr::RData;
-use std::sync::Arc;
 
 static ZERO_IP_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+
+#[derive(Debug, StructOpt)]
+#[structopt(name = "dns-filter", about = "A simple DNS filtering server.")]
+struct Opt {
+    #[structopt(short, long, default_value = "5300")]
+    port: u16,
+
+    #[structopt(short, long, default_value = "hosts/hosts.txt")]
+    blocklist_path: String,
+
+    #[structopt(short, long)]
+    verbose: bool,
+
+    #[structopt(short = "t", long, default_value = "2")]
+    worker_threads: usize,
+}
+
+fn main() {
+    let opt = Opt::from_args();
+    let config = ServerConfig::from_opt(&opt);
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.worker_threads)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run_server(config));
+}
+
+async fn run_server(config: ServerConfig) {
+    let blocklist = process_file(&config.blocklist_path);
+
+    let socket = Arc::new(
+        tokio::net::UdpSocket::bind(("0.0.0.0", config.port))
+            .await
+            .unwrap(),
+    );
+    println!("Listening on port {}", config.port);
+
+    let mut buf = [0; 512];
+    loop {
+        let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
+        let blocklist_ref = blocklist.clone();
+        let socket_ref = socket.clone();
+        let config_ref = config.clone();
+        tokio::spawn(async move {
+            handle_request(&config_ref, &blocklist_ref, &buf[..len], addr, &socket_ref).await;
+        });
+    }
+}
+
+struct ServerConfig {
+    port: u16,
+    blocklist_path: String,
+    verbose: bool,
+    worker_threads: usize,
+}
+
+impl ServerConfig {
+    fn from_opt(opt: &Opt) -> Self {
+        Self {
+            port: opt.port,
+            blocklist_path: opt.blocklist_path.clone(),
+            verbose: opt.verbose,
+            worker_threads: opt.worker_threads,
+        }
+    }
+}
+
+impl Clone for ServerConfig {
+    fn clone(&self) -> Self {
+        Self {
+            port: self.port,
+            blocklist_path: self.blocklist_path.clone(),
+            verbose: self.verbose,
+            worker_threads: self.worker_threads,
+        }
+    }
+}
 
 async fn resolve_domain(domain: &str) -> Result<Vec<IpAddr>, String> {
     let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
@@ -27,18 +100,27 @@ async fn resolve_domain(domain: &str) -> Result<Vec<IpAddr>, String> {
         .lookup_ip(domain)
         .await
         .map_err(|e| format!("Error resolving domain: {}", e))?;
-
     Ok(response.iter().collect())
 }
 
-async fn lookup_ip_address(domain: &str, blocklist: &HashSet<String>) -> Vec<IpAddr> {
+async fn lookup_ip_address(
+    config: &ServerConfig,
+    domain: &str,
+    blocklist: &HashSet<String>,
+) -> Vec<IpAddr> {
     if blocklist.contains(domain) {
-        println!("Domain {} is in the blocklist", domain);
+        if config.verbose {
+            println!("Domain {} is in the blocklist", domain);
+        }
         vec![ZERO_IP_ADDRESS]
     } else {
-        println!("Resolving domain {}", domain);
+        if config.verbose {
+            println!("Resolving domain {}", domain);
+        }
         let result = resolve_domain(domain).await.unwrap_or_else(|_| vec![]);
-        println!("Resolved {} to {:?}", domain, result);
+        if config.verbose {
+            println!("Resolved {} to {:?}", domain, result);
+        }
         result
     }
 }
@@ -67,6 +149,7 @@ fn process_file(file_path: &str) -> HashSet<String> {
 }
 
 async fn handle_request(
+    config: &ServerConfig,
     blocklist: &HashSet<String>,
     buf: &[u8],
     addr: SocketAddr,
@@ -80,7 +163,11 @@ async fn handle_request(
     if request.message_type() == MessageType::Query && request.op_code() == OpCode::Query {
         if let Some(query) = request.queries().first() {
             let name = query.name().to_utf8();
-            let ips = lookup_ip_address(&name, blocklist).await;
+            let ips = lookup_ip_address(config, &name, blocklist).await;
+
+            if config.verbose {
+                println!("Handling request for domain {}", name);
+            }
 
             let mut response = Message::new();
             response.set_id(request.id());
@@ -89,7 +176,6 @@ async fn handle_request(
             response.set_authoritative(true);
             response.set_recursion_desired(request.recursion_desired());
             response.set_recursion_available(true);
-            //response.set_response_code(trust_dns_server::proto::rcode::ResponseCode::NoError);
 
             for ip in ips {
                 if let IpAddr::V4(ipv4) = ip {
@@ -107,31 +193,3 @@ async fn handle_request(
         }
     }
 }
-#[tokio::main]
-async fn main() {
-    let args: Vec<String> = env::args().collect();
-    let port = if args.len() > 1 {
-        args[1].parse::<u16>().unwrap_or(5300)
-    } else {
-        5300
-    };
-
-    let blocklist_path = "hosts/hosts.txt";
-    let blocklist = process_file(blocklist_path);
-
-    let socket = Arc::new(tokio::net::UdpSocket::bind(("0.0.0.0", port))
-        .await
-        .unwrap());
-    println!("Listening on port {}", port);
-    
-    let mut buf = [0; 512];
-    loop { 
-        let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
-        let blocklist_ref = blocklist.clone();
-        let socket_ref = socket.clone();
-        tokio::spawn(async move {
-            handle_request(&blocklist_ref, &buf[..len], addr, &socket_ref).await;
-        });
-    }
-}  
-
