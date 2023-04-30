@@ -7,6 +7,8 @@ edition = "2021"
 
 [dependencies]
 trust-dns-resolver= "*"
+trust-dns-server= "*"
+trust-dns-proto= "*"
 tokio = { version = "1", features = ["full"] }
 
 [profile.release]
