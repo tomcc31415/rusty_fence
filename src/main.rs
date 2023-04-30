@@ -1,17 +1,23 @@
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use structopt::StructOpt;
-//use tokio::sync::mpsc;
 use trust_dns_proto::rr::RData;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::TokioAsyncResolver;
 use trust_dns_server::proto::op::{Message, MessageType, OpCode};
 use trust_dns_server::proto::rr::domain::Name;
 use trust_dns_server::proto::rr::Record;
+
+static DNS_CACHE: Lazy<Mutex<DashMap<String, (HashSet<IpAddr>, u64)>>> =
+    Lazy::new(|| Mutex::new(DashMap::new()));
 
 static ZERO_IP_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
 
@@ -58,7 +64,7 @@ async fn run_server(config: ServerConfig) {
         TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
             .expect("Error creating resolver"),
     );
-    
+
     for _ in 0..config.worker_threads {
         let tx = tx.clone();
         let mut rx = tx.subscribe(); // Create a new receiver for each worker
@@ -82,7 +88,6 @@ async fn run_server(config: ServerConfig) {
         }
     }
 }
-
 
 struct ServerConfig {
     port: u16,
@@ -113,37 +118,79 @@ impl Clone for ServerConfig {
     }
 }
 
+fn get_from_cache_or_resolve(config: &ServerConfig, domain: &str) -> Option<HashSet<IpAddr>> {
+    let cache = DNS_CACHE.lock();
+
+    // Check cache first
+    if let Some(ref_entry) = cache.get(domain) {
+        if config.verbose {
+            println!("Using cached IPs for domain {}", domain);
+        }
+        return Some(ref_entry.value().0.clone());
+    }
+    None
+}
+
 async fn lookup_ip_address(
     config: &ServerConfig,
     domain: &str,
     blocklist: &HashSet<Name>,
     resolver: &TokioAsyncResolver,
-) -> Vec<IpAddr> {
+) -> HashSet<IpAddr> {
+    // Check blocklist first
     if blocklist.contains(&Name::from_str(domain).unwrap()) {
         if config.verbose {
             println!("Domain {} is in the blocklist", domain);
         }
-        vec![ZERO_IP_ADDRESS]
-    } else {
-        if config.verbose {
-            println!("Resolving domain {}", domain);
-        }
-        let response = match resolver.lookup_ip(domain).await {
-            Ok(lookup_ip) => lookup_ip,
-            Err(_) => {
-                if config.verbose {
-                    eprintln!("Error resolving domain {}", domain);
-                }
-                return Vec::new();
-            }
-        };
-
-        let result: Vec<IpAddr> = response.iter().collect();
-        if config.verbose {
-            println!("Resolved {} to {:?}", domain, result);
-        }
-        result
+        let mut zero_ips = HashSet::new();
+        zero_ips.insert(ZERO_IP_ADDRESS);
+        return zero_ips;
     }
+
+    // Check the cache
+    if let Some(cached_entry) = get_from_cache_or_resolve(config, domain) {
+        return cached_entry;
+    }
+
+    // If not in cache, make a DNS query
+    if config.verbose {
+        println!("Resolving domain {}", domain);
+    }
+    let response = match resolver.lookup_ip(domain).await {
+        Ok(lookup_ip) => lookup_ip,
+        Err(_) => {
+            if config.verbose {
+                eprintln!("Error resolving domain {}", domain);
+            }
+            return HashSet::new();
+        }
+    };
+
+    let result: HashSet<IpAddr> = response.iter().collect();
+    if config.verbose {
+        println!("Resolved {} to {:?}", domain, result);
+    }
+
+    // Update cache
+    let cache = DNS_CACHE.lock();
+
+    if cache.len() >= 2000000 {
+        cache.clear();
+        println!("Cache is full. Clearing all entries.");
+    }
+
+    cache.insert(
+        domain.to_string(),
+        (
+            result.clone(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        ),
+    );
+
+    result
 }
 
 fn process_file(file_path: &str) -> HashSet<Name> {
@@ -153,28 +200,24 @@ fn process_file(file_path: &str) -> HashSet<Name> {
 
     for line in reader.lines() {
         let line = line.unwrap();
-        let parts: Vec<&str> = line.split(' ').collect();
-    
-        if parts.len() == 2 {
-            let domain = parts[1].trim().to_string();
-            if !domain.ends_with('.') {
-                let domain_with_dot = format!("{}.", domain);
-                match Name::from_ascii(domain_with_dot.clone()) {
-                    Ok(name) => {
-                        hash_set.insert(name);
-                    }
-                    Err(e) => {
-                        eprintln!("Error parsing domain {}: {}", domain_with_dot, e);
-                    }
+        let domain = line.trim().to_string();
+        if !domain.ends_with('.') {
+            let domain_with_dot = format!("{}.", domain);
+            match Name::from_ascii(domain_with_dot.clone()) {
+                Ok(name) => {
+                    hash_set.insert(name);
                 }
-            } else {
-                match Name::from_ascii(domain.clone()) {
-                    Ok(name) => {
-                        hash_set.insert(name);
-                    }
-                    Err(e) => {
-                        eprintln!("Error parsing domain {}: {}", domain, e);
-                    }
+                Err(e) => {
+                    eprintln!("Error parsing domain {}: {}", domain_with_dot, e);
+                }
+            }
+        } else {
+            match Name::from_ascii(domain.clone()) {
+                Ok(name) => {
+                    hash_set.insert(name);
+                }
+                Err(e) => {
+                    eprintln!("Error parsing domain {}: {}", domain, e);
                 }
             }
         }
@@ -182,6 +225,7 @@ fn process_file(file_path: &str) -> HashSet<Name> {
 
     hash_set
 }
+
 async fn handle_request(
     config: &ServerConfig,
     blocklist: &Arc<HashSet<Name>>,
@@ -228,4 +272,3 @@ async fn handle_request(
         }
     }
 }
-
