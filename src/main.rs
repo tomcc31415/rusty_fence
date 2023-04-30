@@ -2,8 +2,10 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use structopt::StructOpt;
+//use tokio::sync::mpsc;
 use trust_dns_proto::rr::RData;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::TokioAsyncResolver;
@@ -42,7 +44,7 @@ fn main() {
 }
 
 async fn run_server(config: ServerConfig) {
-    let blocklist = process_file(&config.blocklist_path);
+    let blocklist = Arc::new(process_file(&config.blocklist_path));
 
     let socket = Arc::new(
         tokio::net::UdpSocket::bind(("0.0.0.0", config.port))
@@ -51,17 +53,36 @@ async fn run_server(config: ServerConfig) {
     );
     println!("Listening on port {}", config.port);
 
-    let mut buf = [0; 512];
-    loop {
-        let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
-        let blocklist_ref = blocklist.clone();
-        let socket_ref = socket.clone();
-        let config_ref = config.clone();
+    let (tx, _) = tokio::sync::broadcast::channel::<(Vec<u8>, SocketAddr)>(100);
+    let resolver = Arc::new(
+        TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
+            .expect("Error creating resolver"),
+    );
+    
+    for _ in 0..config.worker_threads {
+        let tx = tx.clone();
+        let mut rx = tx.subscribe(); // Create a new receiver for each worker
+        let blocklist = blocklist.clone();
+        let socket = socket.clone();
+        let config = config.clone();
+        let resolver = resolver.clone();
         tokio::spawn(async move {
-            handle_request(&config_ref, &blocklist_ref, &buf[..len], addr, &socket_ref).await;
+            while let Ok((buf, addr)) = rx.recv().await {
+                handle_request(&config, &blocklist, &buf, addr, &socket, &resolver).await;
+            }
         });
     }
+
+    let mut buf = [0; 4096];
+    loop {
+        let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
+        let buf = buf[..len].to_vec();
+        if let Err(_) = tx.send((buf, addr)) {
+            eprintln!("Error sending data to worker");
+        }
+    }
 }
+
 
 struct ServerConfig {
     port: u16,
@@ -92,23 +113,13 @@ impl Clone for ServerConfig {
     }
 }
 
-async fn resolve_domain(domain: &str) -> Result<Vec<IpAddr>, String> {
-    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
-        .map_err(|e| format!("Error creating resolver: {}", e))?;
-
-    let response = resolver
-        .lookup_ip(domain)
-        .await
-        .map_err(|e| format!("Error resolving domain: {}", e))?;
-    Ok(response.iter().collect())
-}
-
 async fn lookup_ip_address(
     config: &ServerConfig,
     domain: &str,
-    blocklist: &HashSet<String>,
+    blocklist: &HashSet<Name>,
+    resolver: &TokioAsyncResolver,
 ) -> Vec<IpAddr> {
-    if blocklist.contains(domain) {
+    if blocklist.contains(&Name::from_str(domain).unwrap()) {
         if config.verbose {
             println!("Domain {} is in the blocklist", domain);
         }
@@ -117,7 +128,17 @@ async fn lookup_ip_address(
         if config.verbose {
             println!("Resolving domain {}", domain);
         }
-        let result = resolve_domain(domain).await.unwrap_or_else(|_| vec![]);
+        let response = match resolver.lookup_ip(domain).await {
+            Ok(lookup_ip) => lookup_ip,
+            Err(_) => {
+                if config.verbose {
+                    eprintln!("Error resolving domain {}", domain);
+                }
+                return Vec::new();
+            }
+        };
+
+        let result: Vec<IpAddr> = response.iter().collect();
         if config.verbose {
             println!("Resolved {} to {:?}", domain, result);
         }
@@ -125,7 +146,7 @@ async fn lookup_ip_address(
     }
 }
 
-fn process_file(file_path: &str) -> HashSet<String> {
+fn process_file(file_path: &str) -> HashSet<Name> {
     let file = File::open(file_path).unwrap();
     let reader = BufReader::new(file);
     let mut hash_set = HashSet::new();
@@ -133,27 +154,41 @@ fn process_file(file_path: &str) -> HashSet<String> {
     for line in reader.lines() {
         let line = line.unwrap();
         let parts: Vec<&str> = line.split(' ').collect();
-
+    
         if parts.len() == 2 {
             let domain = parts[1].trim().to_string();
             if !domain.ends_with('.') {
                 let domain_with_dot = format!("{}.", domain);
-                hash_set.insert(domain_with_dot.clone());
+                match Name::from_ascii(domain_with_dot.clone()) {
+                    Ok(name) => {
+                        hash_set.insert(name);
+                    }
+                    Err(e) => {
+                        eprintln!("Error parsing domain {}: {}", domain_with_dot, e);
+                    }
+                }
             } else {
-                hash_set.insert(domain.clone());
+                match Name::from_ascii(domain.clone()) {
+                    Ok(name) => {
+                        hash_set.insert(name);
+                    }
+                    Err(e) => {
+                        eprintln!("Error parsing domain {}: {}", domain, e);
+                    }
+                }
             }
         }
     }
 
     hash_set
 }
-
 async fn handle_request(
     config: &ServerConfig,
-    blocklist: &HashSet<String>,
+    blocklist: &Arc<HashSet<Name>>,
     buf: &[u8],
     addr: SocketAddr,
     socket: &tokio::net::UdpSocket,
+    resolver: &Arc<TokioAsyncResolver>,
 ) {
     let request = match Message::from_vec(buf) {
         Ok(msg) => msg,
@@ -163,7 +198,7 @@ async fn handle_request(
     if request.message_type() == MessageType::Query && request.op_code() == OpCode::Query {
         if let Some(query) = request.queries().first() {
             let name = query.name().to_utf8();
-            let ips = lookup_ip_address(config, &name, blocklist).await;
+            let ips = lookup_ip_address(config, &name, blocklist, resolver).await;
 
             if config.verbose {
                 println!("Handling request for domain {}", name);
@@ -193,3 +228,4 @@ async fn handle_request(
         }
     }
 }
+
