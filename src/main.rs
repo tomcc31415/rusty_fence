@@ -245,36 +245,81 @@ async fn handle_request(
         Err(_) => return,
     };
 
-    if request.message_type() == MessageType::Query && request.op_code() == OpCode::Query {
-        if let Some(query) = request.queries().first() {
-            let name = query.name().to_utf8();
-            let ips = lookup_ip_address(config, &name, blocklist, resolver).await;
-
-            if config.verbose {
-                println!("Handling request for domain {}", name);
-            }
-
-            let mut response = Message::new();
-            response.set_id(request.id());
-            response.set_message_type(MessageType::Response);
-            response.set_op_code(OpCode::Query);
-            response.set_authoritative(true);
-            response.set_recursion_desired(request.recursion_desired());
-            response.set_recursion_available(true);
-
-            for ip in ips {
-                if let IpAddr::V4(ipv4) = ip {
-                    let record = Record::from_rdata(
-                        Name::from_utf8(query.name().to_utf8().as_str()).unwrap(),
-                        60,
-                        RData::A(ipv4),
-                    );
-                    response.add_answer(record);
-                }
-            }
-
-            let response_bytes = response.to_vec().unwrap();
-            socket.send_to(&response_bytes, addr).await.unwrap();
-        }
+    if !request_matches_conditions(&request) {
+        return;
     }
+    
+    if let Some(query) = request.queries().first() {
+        let name = query.name().to_utf8();
+        let ips = lookup_ip_address(config, &name, blocklist, resolver).await;
+
+        if config.verbose {
+            println!("Handling request for domain {}", name);
+        }
+
+        let ipv4_ips = match filter_ipv4_ips(ips) {
+            Ok(ips) => ips,
+            Err(e) => {
+                eprintln!("Error filtering IPv4 addresses: {}", e);
+                return;
+            }
+        };
+
+        let mut response = build_response(request.recursion_desired(), request.id());
+
+        if let Err(error) = populate_response_with_ipv4(ipv4_ips, query, &mut response) {
+            eprintln!("Error populating response: {}", error);
+            return;
+        }
+
+        let response_bytes = response.to_vec().unwrap();
+        socket.send_to(&response_bytes, addr).await.unwrap();
+    }
+}
+
+
+
+fn build_response(recursion_desired: bool, request_id: u16) -> Message {
+    let mut response = Message::new();
+    response.set_id(request_id);
+    response.set_message_type(MessageType::Response);
+    response.set_op_code(OpCode::Query);
+    response.set_authoritative(true);
+    response.set_recursion_desired(recursion_desired);
+    response.set_recursion_available(true);
+    response
+}
+
+
+fn request_matches_conditions(request: &Message) -> bool {
+    request.message_type() == MessageType::Query
+        && request.op_code() == OpCode::Query
+        && request.queries().first().map_or(false, |query| !query.name().is_root())
+}
+
+fn filter_ipv4_ips(ips: HashSet<IpAddr>) -> Result<HashSet<Ipv4Addr>, &'static str> {
+    ips.into_iter()
+        .filter(|ip| ip.is_ipv4())
+        .map(|ip| match ip {
+            IpAddr::V4(ipv4) => Ok(ipv4),
+            _ => Err("Non-IPv4 address encountered"),
+        })
+        .collect()
+}
+
+fn populate_response_with_ipv4(ips: HashSet<Ipv4Addr>, query: &trust_dns_proto::op::Query, response: &mut Message) -> Result<(), &'static str> {
+    if ips.is_empty() {
+        return Err("The HashSet of IP addresses is empty");
+    }
+
+    let records: Vec<Record> = ips.into_iter()
+        .map(|ipv4| {
+            let name = Name::from_utf8(query.name().to_utf8().as_str()).unwrap();
+            let rdata = RData::A(ipv4);
+            Record::from_rdata(name, 60, rdata)
+        })
+        .collect();
+
+    response.add_answers(records);
+    Ok(())
 }
