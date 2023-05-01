@@ -19,7 +19,12 @@ use trust_dns_server::proto::rr::Record;
 static DNS_CACHE: Lazy<Mutex<DashMap<String, (HashSet<IpAddr>, u64)>>> =
     Lazy::new(|| Mutex::new(DashMap::new()));
 
-static ZERO_IP_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+//static ZERO_IP_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+static ZERO_IP_SET: Lazy<HashSet<IpAddr>> = Lazy::new(|| {
+    let mut set = HashSet::new();
+    set.insert(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+    set
+});
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "dns-filter", about = "A simple DNS filtering server.")]
@@ -142,9 +147,10 @@ async fn lookup_ip_address(
         if config.verbose {
             println!("Domain {} is in the blocklist", domain);
         }
-        let mut zero_ips = HashSet::new();
-        zero_ips.insert(ZERO_IP_ADDRESS);
-        return zero_ips;
+       // let mut zero_ips = HashSet::new();
+       // zero_ips.insert(ZERO_IP_ADDRESS);
+       // return zero_ips;
+        return ZERO_IP_SET.clone()
     }
 
     // Check the cache
