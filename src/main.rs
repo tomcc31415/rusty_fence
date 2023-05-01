@@ -19,7 +19,6 @@ use trust_dns_server::proto::rr::Record;
 static DNS_CACHE: Lazy<Mutex<DashMap<String, (HashSet<IpAddr>, u64)>>> =
     Lazy::new(|| Mutex::new(DashMap::new()));
 
-//static ZERO_IP_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
 static ZERO_IP_SET: Lazy<HashSet<IpAddr>> = Lazy::new(|| {
     let mut set = HashSet::new();
     set.insert(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
@@ -40,6 +39,9 @@ struct Opt {
 
     #[structopt(short = "t", long, default_value = "2")]
     worker_threads: usize,
+
+    #[structopt(long, default_value = "0.0.0.0")]
+    bind_address: Ipv4Addr,
 }
 
 fn main() {
@@ -54,15 +56,23 @@ fn main() {
         .block_on(run_server(config));
 }
 
+/* The code below does the following:
+1. Create a UDP socket
+2. Create a broadcast channel
+3. Spawn 2 (default) worker threads
+4. Listen for packets on the UDP socket
+5. Send the packets to the broadcast channel
+6. The workers receive the packets and send them to the blocking function */
+
 async fn run_server(config: ServerConfig) {
     let blocklist = Arc::new(process_file(&config.blocklist_path));
 
     let socket = Arc::new(
-        tokio::net::UdpSocket::bind(("0.0.0.0", config.port))
+        tokio::net::UdpSocket::bind((config.bind_address, config.port))
             .await
             .unwrap(),
     );
-    println!("Listening on port {}", config.port);
+    println!("Listening on {}:{}", config.bind_address, config.port);
 
     let (tx, _) = tokio::sync::broadcast::channel::<(Vec<u8>, SocketAddr)>(100);
     let resolver = Arc::new(
@@ -99,6 +109,7 @@ struct ServerConfig {
     blocklist_path: String,
     verbose: bool,
     worker_threads: usize,
+    bind_address: Ipv4Addr, 
 }
 
 impl ServerConfig {
@@ -108,6 +119,7 @@ impl ServerConfig {
             blocklist_path: opt.blocklist_path.clone(),
             verbose: opt.verbose,
             worker_threads: opt.worker_threads,
+            bind_address: opt.bind_address,
         }
     }
 }
@@ -119,10 +131,16 @@ impl Clone for ServerConfig {
             blocklist_path: self.blocklist_path.clone(),
             verbose: self.verbose,
             worker_threads: self.worker_threads,
+            bind_address: self.bind_address, 
         }
     }
 }
 
+/* The code below does the following:
+1. Starts a DNS query for the domain
+2. Listens for incoming responses
+3. Stops the query after it receives a response
+4. Returns the list of IP addresses */
 fn get_from_cache_or_resolve(config: &ServerConfig, domain: &str) -> Option<HashSet<IpAddr>> {
     let cache = DNS_CACHE.lock();
 
@@ -136,6 +154,13 @@ fn get_from_cache_or_resolve(config: &ServerConfig, domain: &str) -> Option<Hash
     None
 }
 
+/* The code below does the following:
+1. Fetches the list of domains from the blocklist.txt file
+2. Creates a set of domains to block
+3. Starts a DNS server that listens on port 5300 (default)
+4. Forwards all requests to the upstream DNS server
+5. Blocks requests to domains in the blocklist */
+
 async fn lookup_ip_address(
     config: &ServerConfig,
     domain: &str,
@@ -147,9 +172,7 @@ async fn lookup_ip_address(
         if config.verbose {
             println!("Domain {} is in the blocklist", domain);
         }
-       // let mut zero_ips = HashSet::new();
-       // zero_ips.insert(ZERO_IP_ADDRESS);
-       // return zero_ips;
+
         return ZERO_IP_SET.clone()
     }
 
@@ -232,6 +255,12 @@ fn process_file(file_path: &str) -> HashSet<Name> {
     hash_set
 }
 
+
+/* The code below does the following:
+1. Create a UDP socket that listens on port 5300 (default)
+2. Create a resolver that uses the system's DNS servers
+3. Listen for incoming requests
+4. Handle each request in a separate thread */
 async fn handle_request(
     config: &ServerConfig,
     blocklist: &Arc<HashSet<Name>>,
@@ -248,7 +277,7 @@ async fn handle_request(
     if !request_matches_conditions(&request) {
         return;
     }
-    
+
     if let Some(query) = request.queries().first() {
         let name = query.name().to_utf8();
         let ips = lookup_ip_address(config, &name, blocklist, resolver).await;
@@ -278,7 +307,9 @@ async fn handle_request(
 }
 
 
-
+/* The code below does the following:
+1. Sends the request to the upstream DNS server.
+2. Prints the response received from the upstream DNS server */
 fn build_response(recursion_desired: bool, request_id: u16) -> Message {
     let mut response = Message::new();
     response.set_id(request_id);
