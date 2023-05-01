@@ -160,7 +160,6 @@ fn get_from_cache_or_resolve(config: &ServerConfig, domain: &str) -> Option<Hash
 3. Starts a DNS server that listens on port 5300 (default)
 4. Forwards all requests to the upstream DNS server
 5. Blocks requests to domains in the blocklist */
-
 async fn lookup_ip_address(
     config: &ServerConfig,
     domain: &str,
